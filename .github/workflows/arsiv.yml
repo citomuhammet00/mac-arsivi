@@ -16,20 +16,32 @@ jobs:
       - name: Arsivi olustur
         run: |
           python3 - <<'PY'
-          import csv, io, json, os, time, datetime, urllib.request
+          import csv, io, json, os, time, datetime, shutil, urllib.request
 
           LIGLER = ["E0","E1","E2","E3","EC","SC0","SC1","SC2","SC3","D1","D2","I1","I2",
                     "SP1","SP2","F1","F2","N1","B1","P1","T1","G1"]
+          EK_LIGLER = ["ARG","AUT","BRA","CHN","DNK","FIN","IRL","JPN","MEX","NOR","POL","ROU","RUS","SWE","SWZ","USA"]
           ILK_SEZON = 2005
+          EK_ILK_SEZON = 2012
           BASE = "https://www.football-data.co.uk/mmz4281/{s}/{l}.csv"
+          EK_BASE = "https://www.football-data.co.uk/new/{l}.csv"
           YAKLASAN = "https://www.football-data.co.uk/fixtures.csv"
+          ONB = "onbellek2"
           SUTUNLAR = ["tarih","lig","ev","dep","evg","depg","evig","depig","evk","depk","evf","depf",
+                      "evs","deps","evis","depis","evsk","depsk","evkk","depkk","evo","depo",
                       "o1","ox","o2","ou","oa"]
+          KAYNAK = {"evg":["FTHG","HG"],"depg":["FTAG","AG"],"evig":["HTHG"],"depig":["HTAG"],
+                    "evk":["HC"],"depk":["AC"],"evf":["HF"],"depf":["AF"],"evs":["HS"],"deps":["AS"],
+                    "evis":["HST"],"depis":["AST"],"evsk":["HY"],"depsk":["AY"],"evkk":["HR"],"depkk":["AR"],
+                    "evo":["HO"],"depo":["AO"]}
+          ORAN = {"o1":["AvgH","BbAvH","B365H","PSH","AvgCH","PSCH"],"ox":["AvgD","BbAvD","B365D","PSD","AvgCD","PSCD"],
+                  "o2":["AvgA","BbAvA","B365A","PSA","AvgCA","PSCA"],"ou":["Avg>2.5","BbAv>2.5","B365>2.5","P>2.5"],
+                  "oa":["Avg<2.5","BbAv<2.5","B365<2.5","P<2.5"]}
 
           def indir(url):
               req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 mac-arsivi"})
               try:
-                  with urllib.request.urlopen(req, timeout=60) as r:
+                  with urllib.request.urlopen(req, timeout=90) as r:
                       b = r.read()
               except Exception as e:
                   print("  atlandi:", url, e)
@@ -41,17 +53,21 @@ jobs:
                       pass
               return None
 
-          def sayi(v):
-              try:
-                  return int(float(v))
-              except (TypeError, ValueError):
-                  return None
-
-          def oran(row, *adlar):
+          def sayi(row, adlar):
               for a in adlar:
                   v = row.get(a)
+                  if v is None or str(v).strip() == "":
+                      continue
                   try:
-                      f = float(v)
+                      return int(float(v))
+                  except ValueError:
+                      pass
+              return None
+
+          def oran(row, adlar):
+              for a in adlar:
+                  try:
+                      f = float(row.get(a))
                       if f > 1:
                           return round(f * 100)
                   except (TypeError, ValueError):
@@ -66,25 +82,27 @@ jobs:
                       pass
               return None
 
-          def satirlar(text, lig=None):
+          def satirlar(text, lig=None, ilk_sezon=None):
               out = []
               for row in csv.DictReader(io.StringIO(text)):
                   row = {(k or "").strip(): v for k, v in row.items()}
-                  ev, dep, t = row.get("HomeTeam") or row.get("Home"), row.get("AwayTeam") or row.get("Away"), tarih(row.get("Date"))
+                  ev = row.get("HomeTeam") or row.get("Home")
+                  dep = row.get("AwayTeam") or row.get("Away")
+                  t = tarih(row.get("Date"))
                   if not ev or not dep or not t:
                       continue
-                  out.append({
-                      "tarih": t, "lig": lig or row.get("Div"), "ev": ev.strip(), "dep": dep.strip(),
-                      "evg": sayi(row.get("FTHG") or row.get("HG")), "depg": sayi(row.get("FTAG") or row.get("AG")),
-                      "evig": sayi(row.get("HTHG")), "depig": sayi(row.get("HTAG")),
-                      "evk": sayi(row.get("HC")), "depk": sayi(row.get("AC")),
-                      "evf": sayi(row.get("HF")), "depf": sayi(row.get("AF")),
-                      "o1": oran(row, "AvgH", "BbAvH", "B365H", "PSH"),
-                      "ox": oran(row, "AvgD", "BbAvD", "B365D", "PSD"),
-                      "o2": oran(row, "AvgA", "BbAvA", "B365A", "PSA"),
-                      "ou": oran(row, "Avg>2.5", "BbAv>2.5", "B365>2.5", "P>2.5"),
-                      "oa": oran(row, "Avg<2.5", "BbAv<2.5", "B365<2.5", "P<2.5"),
-                  })
+                  if ilk_sezon:
+                      try:
+                          if int(str(row.get("Season", "0"))[:4]) < ilk_sezon:
+                              continue
+                      except ValueError:
+                          pass
+                  m = {"tarih": t, "lig": lig or row.get("Div"), "ev": ev.strip(), "dep": dep.strip()}
+                  for k, adlar in KAYNAK.items():
+                      m[k] = sayi(row, adlar)
+                  for k, adlar in ORAN.items():
+                      m[k] = oran(row, adlar)
+                  out.append(m)
               return out
 
           def sezonlar():
@@ -92,13 +110,17 @@ jobs:
               son = bugun.year if bugun.month >= 7 else bugun.year - 1
               return [f"{y % 100:02d}{(y + 1) % 100:02d}" for y in range(ILK_SEZON, son + 1)], f"{son % 100:02d}{(son + 1) % 100:02d}"
 
+          def kaydet(yol, rows):
+              json.dump(rows, open(yol, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
+
           def main():
-              os.makedirs("onbellek", exist_ok=True)
+              shutil.rmtree("onbellek", ignore_errors=True)
+              os.makedirs(ONB, exist_ok=True)
               liste, guncel = sezonlar()
               maclar = []
               for lig in LIGLER:
                   for s in liste:
-                      yol = f"onbellek/{lig}_{s}.json"
+                      yol = f"{ONB}/{lig}_{s}.json"
                       if s != guncel and os.path.exists(yol):
                           maclar += json.load(open(yol, encoding="utf-8"))
                           continue
@@ -107,26 +129,43 @@ jobs:
                       if not text:
                           continue
                       rows = satirlar(text, lig)
-                      json.dump(rows, open(yol, "w", encoding="utf-8"), ensure_ascii=False)
+                      kaydet(yol, rows)
                       maclar += rows
                       print(f"{lig} {s}: {len(rows)} mac")
+              for lig in EK_LIGLER:
+                  yol = f"{ONB}/{lig}.json"
+                  text = indir(EK_BASE.format(l=lig))
+                  time.sleep(0.3)
+                  if text:
+                      rows = satirlar(text, lig, EK_ILK_SEZON)
+                      kaydet(yol, rows)
+                      print(f"{lig}: {len(rows)} mac")
+                  elif os.path.exists(yol):
+                      rows = json.load(open(yol, encoding="utf-8"))
+                  else:
+                      continue
+                  maclar += rows
               maclar.sort(key=lambda m: m["tarih"])
+              ligler = LIGLER + EK_LIGLER
               takimlar = sorted({m["ev"] for m in maclar} | {m["dep"] for m in maclar})
               ti = {t: i for i, t in enumerate(takimlar)}
-              li = {l: i for i, l in enumerate(LIGLER)}
-              paket = [[m["tarih"], li.get(m["lig"], -1), ti[m["ev"]], ti[m["dep"]]] + [m[k] for k in SUTUNLAR[4:]] for m in maclar]
+              li = {l: i for i, l in enumerate(ligler)}
+              satir = []
+              for m in maclar:
+                  vals = [m["tarih"], li.get(m["lig"], -1), ti[m["ev"]], ti[m["dep"]]] + [m[k] for k in SUTUNLAR[4:]]
+                  satir.append(",".join("" if v is None else str(v) for v in vals))
               zaman = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-              json.dump({"v": 1, "guncelleme": zaman, "sutunlar": SUTUNLAR, "ligler": LIGLER,
-                         "takimlar": takimlar, "maclar": paket},
+              json.dump({"v": 2, "guncelleme": zaman, "sutunlar": SUTUNLAR, "ligler": ligler,
+                         "takimlar": takimlar, "veri": "\n".join(satir)},
                         open("arsiv.json", "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
               text = indir(YAKLASAN)
               yak = satirlar(text) if text else []
               json.dump({"guncelleme": zaman, "maclar": yak}, open("yaklasan.json", "w", encoding="utf-8"),
                         ensure_ascii=False, separators=(",", ":"))
-              json.dump({"guncelleme": zaman, "mac_sayisi": len(paket), "yaklasan": len(yak),
+              json.dump({"guncelleme": zaman, "mac_sayisi": len(satir), "yaklasan": len(yak), "surum": 2,
                          "boyut_kb": os.path.getsize("arsiv.json") // 1024},
                         open("bilgi.json", "w", encoding="utf-8"), ensure_ascii=False)
-              print(f"TAMAM: {len(paket)} mac, {len(yak)} yaklasan mac")
+              print(f"TAMAM: {len(satir)} mac, {len(yak)} yaklasan mac")
 
           main()
           PY
