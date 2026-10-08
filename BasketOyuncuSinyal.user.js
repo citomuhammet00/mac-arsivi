@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Basket Oyuncu Sinyal
 // @namespace    basketoyuncusinyal
-// @version      1.1
+// @version      1.2
 // @description  Bilyoner basketbol oyuncu bahisleri (NBA + EuroLeague): kesin kadro takibi, oyun içi pozisyon analizi, rotasyon/yokluk etkisi, maç senaryosu, simülasyon, gölge kayıt ve kendini sınama
 // @match        https://www.bilyoner.com/*
 // @grant        GM_xmlhttpRequest
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const SURUM = '1.1';
+  const SURUM = '1.2';
   const SS = 'https://www.sofascore.com/api/v1';
   const ESPN = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba';
   const EL_LIVE = 'https://live.euroleague.net/api';
@@ -519,6 +519,15 @@
       }
       const bitmis = ev.filter(e => bittiMi(e) && simdiSn() - e.startTimestamp < ARSIV_GUN * 86400 && !DOSTLUK.test(norm(turnuvaAdi(e))))
         .sort((a, b) => b.startTimestamp - a.startTimestamp).slice(0, ARSIV_MAC);
+      // 1.0'dan kalan maçlarda lig ve takım adı yok: eldeki maç listesinden doldur
+      ev.forEach(e => {
+        const g = arsiv()[e.id];
+        if (!g || g.l || !e.homeTeam || !e.awayTeam) return;
+        const ut = e.tournament && e.tournament.uniqueTournament;
+        g.l = turnuvaAdi(e); g.ut = ut ? ut.id : null; g.s = e.season ? e.season.id : null;
+        g.hn = e.homeTeam.name || ''; g.an = e.awayTeam.name || '';
+        arsivKirli = true;
+      });
       await Promise.all(bitmis.filter(e => !arsiv()[e.id]).map(e => maciArsivle(e)));
       return { son: bitmis.length ? bitmis[0].startTimestamp : 0, sayi: bitmis.length };
     });
@@ -888,10 +897,12 @@
   }
   // Pozisyon kayıtları: bo_poz["maçId|takımId"] = { t, k: EL|ESPN|yok|hata, o: { sofascoreOyuncuId: [35 sayı] } }
   let POZ = null, pozKirli = false;
-  const pozTablo = () => { if (!POZ) POZ = GM_getValue('bo_poz', {}); return POZ; };
+  // 1.1'in adı olmayan maçlar için yazdığı "bulunamadı/hatalı" kayıtlar tekrar denensin
+  const eskiPozTemizle = P => { Object.keys(P).forEach(k => { const x = P[k]; if (x && (x.k === 'yok' || x.k === 'hata') && !x.v) { delete P[k]; pozKirli = true; } }); return P; };
+  const pozTablo = () => { if (!POZ) POZ = eskiPozTemizle(GM_getValue('bo_poz', {})); return POZ; };
   function pozKaydet() {
     if (!pozKirli) return;
-    const P = Object.assign(GM_getValue('bo_poz', {}), pozTablo());
+    const P = Object.assign(eskiPozTemizle(GM_getValue('bo_poz', {})), pozTablo());
     POZ = P;
     const k = Object.keys(P);
     if (k.length > POZ_MAX) k.sort((a, b) => (P[a].t || 0) - (P[b].t || 0)).slice(0, k.length - POZ_MAX).forEach(x => delete P[x]);
@@ -986,10 +997,10 @@
   async function pozIndir(tid, maclar, O, ligTur) {
     const P = pozTablo();
     const uygun = m => !m.l || ligTuru(m.l) === ligTur;
-    const hedef = maclar.filter(uygun).slice(0, POZ_MAC).filter(m => !P[m.eid + '|' + tid]).slice(0, POZ_YENI[ligTur] || 4);
+    const hedef = maclar.filter(m => uygun(m) && m.ad && m.rakipAd).slice(0, POZ_MAC).filter(m => !P[m.eid + '|' + tid]).slice(0, POZ_YENI[ligTur] || 4);
     for (const m of hedef) {
       const anahtar = m.eid + '|' + tid;
-      const yaz = (k, neden) => { P[anahtar] = { t: m.ts, k, neden }; pozKirli = true; };
+      const yaz = (k, neden) => { P[anahtar] = { t: m.ts, k, neden, v: 2 }; pozKirli = true; };
       try {
         let olaylar, harita = {}, perUzun, kaynak, yedekEtiket = () => null;
         const basla = {};
@@ -1254,7 +1265,7 @@
     return { ids, kesin: false };
   }
   function takimProjeksiyon(a, belirsizA) {
-    const { maclar, O, D, sen, ilk5, poz, savunma, b2b, w, onceki, G } = a;
+    const { maclar, O, D, sen, ilk5, poz, savunma, b2b, w, onceki, G, dkDuz } = a;
     const reg = regDakika(maclar), maxDk = reg / 5 * 0.95;
     const aDeg = id => { const d = D[id]; if (!d) return 0; return d.a === '?' ? belirsizA : d.a; };
     const tumO = Object.values(O);
@@ -1333,6 +1344,9 @@
       if (W > 0) alt.forEach(x => { x.dk = Math.min(maxDk, x.dk + kesilen * x.dk / W); });
     }
     if (b2b) Object.values(P).forEach(x => { if (x.dk >= 30) x.dk *= 0.97; });
+    // Maç sonu karnesinden: geçmiş dakika tahminleri hep fazla/az çıktıysa düzelt
+    Object.values(P).forEach(x => { x.ilkBelli = ilkSet.size === 5; x.dkHam = x.dk; });
+    if (dkDuz && ilkSet.size === 5) Object.values(P).forEach(x => { const d = x.bugunIlk ? dkDuz.ilk : dkDuz.yedek; if (d) { x.dk = sinirla(x.dk + d, 1, maxDk); x.karneDuz = d; } });
     // Dakika başı üretim: mevki ortalamasına çekme (yeni gelen için önceki takımı), şans düzeltmesi, yokluk, pozisyon, rakip savunma
     const pozOran = {};
     tumO.forEach(o => {
@@ -1470,7 +1484,7 @@
           const r = sat.find(y => String(y[0]) === String(x.p));
           const o = r ? satirAc(r) : null;
           if (!o || !(o.dk > 0)) x.r = -1;
-          else { x.v = TIP[x.t].b.reduce((t, s) => t + (o[s] || 0), 0); x.r = x.v >= x.n ? 1 : 0; }
+          else { x.v = TIP[x.t].b.reduce((t, s) => t + (o[s] || 0), 0); x.r = x.v >= x.n ? 1 : 0; x.gd = Math.round(o.dk * 10) / 10; x.gi = o.ilk; }
           n++;
         });
         golgeKirli = true;
@@ -1482,6 +1496,44 @@
     arsivKaydet();
     golgeKaydet();
     return n;
+  }
+  // ---------- Maç sonu karnesi: tahmin ile gerçeği karşılaştır, kaybın sebebini bul ----------
+  // Ortak biçim: { r: 1/0, v: gerçek değer, n: çizgi, d: tahmini dk, gd: gerçek dk, il: tahmin ilk 5, gi: gerçek ilk 5, m: tahmini ortalama, et: dayanak etiketleri }
+  function karneSebep(x) {
+    if (x.r !== 0) return null;
+    if (x.il === 1 && x.gi === 0) return 'rol';
+    if (x.d != null && x.gd != null && x.gd < x.d - 5) return 'dakika';
+    if (x.v != null && x.v >= x.n - 1) return 'kil';
+    return 'verim';
+  }
+  const SEBEP_AD = { rol: 'rol: ilk 5 dedik, yedekten başladı', dakika: 'dakika: beklenenden 5+ dk az oynadı', kil: 'kıl payı: çizgiye 1 kala kaldı', verim: 'verim: dakikayı aldı ama üretemedi' };
+  const ETIKET_AD = { y: 'yokluk analizine dayananlar', p: 'pozisyon değişikliğine dayananlar', d: 'sakatlık dönüşü olanlar', r: 'ilk 5 / yedek değişikliği olanlar' };
+  // Kayıtlardan da aynı biçime çevir (gölgede olmayanlar için)
+  const kayitKarne = r => {
+    const s = r.sonuc, t = r.tahmin;
+    if (!s || !t || s.elle || (s.durum !== 'tuttu' && s.durum !== 'tutmadi')) return null;
+    return { r: s.durum === 'tuttu' ? 1 : 0, v: s.deger, n: r.N, d: t.dk, dh: t.dh, gd: s.dk, il: t.il, gi: s.ilk, m: t.ort, et: t.et || '', t: r.tip, g: r.guven, e: r.ssId, p: r.oyuncuId, ad: r.oyuncu, secim: r.secim };
+  };
+  function karneVerisi() {
+    const g = golgeAl().filter(x => (x.r === 0 || x.r === 1) && x.d != null);
+    const ids = new Set(golgeAl().map(x => x.i));
+    return g.concat(kayitAl().filter(r => !ids.has(r.id)).map(kayitKarne).filter(Boolean));
+  }
+  // Dakika düzeltmesi: aynı oyuncu-maç bir kez sayılır
+  function dakikaDuzeltme() {
+    const tek = {};
+    karneVerisi().forEach(x => { if (x.d != null && x.gd > 0 && (x.il === 0 || x.il === 1)) tek[x.e + '|' + x.p] = x; });
+    const sonuc = {};
+    [['ilk', 1], ['yedek', 0]].forEach(([k, il]) => {
+      const l = Object.values(tek).filter(x => x.il === il);
+      const n = l.length;
+      sonuc['n' + k] = n;
+      sonuc['h' + k] = n ? mean(l.map(x => x.gd - x.d)) : 0;
+      const ham = n ? mean(l.map(x => x.gd - (x.dh != null ? x.dh : x.d))) : 0;
+      const d = n >= 20 ? Math.round(sinirla(ham * n / (n + 30), -3, 3) * 10) / 10 : 0;
+      sonuc[k] = Math.abs(d) >= 0.3 ? d : 0;
+    });
+    return sonuc;
   }
   // Pazar bazında kalan sapma (kalibrasyondan sonra), gölge kayıt + elle kayıtlar
   function ogrenme() {
@@ -1727,9 +1779,10 @@
     const belirsizAd = Object.keys(DA).filter(id => DA[id].a === '?').map(id => OA[id].ad).concat(Object.keys(DB).filter(id => DB[id].a === '?').map(id => OB[id].ad));
     const senaryolar = belirsizAd.length ? [0, 1] : [0];
     adim('Rotasyon, pozisyon ve simülasyon');
+    const dkDuz = dakikaDuzeltme();
     const proj = senaryolar.map(bA => ({
-      A: takimProjeksiyon({ maclar: MA, O: OA, D: DA, sen: sen.ev, ilk5: ilk5Belirle(OA, MA, DA, ssKesin && kA ? kA.ilk : [], bA), poz: pzA, savunma: savA, b2b: b2b(MA), w: wA, onceki, G }, bA),
-      B: takimProjeksiyon({ maclar: MB, O: OB, D: DB, sen: sen.dep, ilk5: ilk5Belirle(OB, MB, DB, ssKesin && kB ? kB.ilk : [], bA), poz: pzB, savunma: savB, b2b: b2b(MB), w: wB, onceki, G }, bA)
+      A: takimProjeksiyon({ maclar: MA, O: OA, D: DA, sen: sen.ev, ilk5: ilk5Belirle(OA, MA, DA, ssKesin && kA ? kA.ilk : [], bA), poz: pzA, savunma: savA, b2b: b2b(MA), w: wA, onceki, G, dkDuz }, bA),
+      B: takimProjeksiyon({ maclar: MB, O: OB, D: DB, sen: sen.dep, ilk5: ilk5Belirle(OB, MB, DB, ssKesin && kB ? kB.ilk : [], bA), poz: pzB, savunma: savB, b2b: b2b(MB), w: wB, onceki, G, dkDuz }, bA)
     }));
     const ilk5Kesin = { A: !!(proj[0].A.ilk5 && proj[0].A.ilk5.kesin), B: !!(proj[0].B.ilk5 && proj[0].B.ilk5.kesin) };
     const ogr = ogrenme();
@@ -1769,6 +1822,8 @@
       };
       const takimAd = gr.takim === 'A' ? ev : dep;
       const nEtkin = o.oyn.length + (onceki[o.id] ? onceki[o.id].n : 0);
+      // Bu oyuncunun tahmini neye dayanıyor (karnede ayrı ayrı ölçülür)
+      const dayanak = (ana.kanit.some(k => Math.abs(k.a - k.f) >= 0.5 && Math.abs((k.a - k.f) * k.dDk) >= 1.5) ? 'y' : '') + (ana.slotF && ana.slotF.f ? 'p' : '') + (ana.donus ? 'd' : '') + (ana.durumDegisti ? 'r' : '');
       const enIyi = {};
       gr.secimler.forEach(sc => {
         const b = TIP[sc.tip].b;
@@ -1786,7 +1841,8 @@
         const id = mac.id + '|' + sc.tip + '|' + gr.id + '|' + sc.N;
         const satir = { id, secim: sc.ad + ' ' + sc.N + '+ ' + TIP[sc.tip].birim, tip: sc.tip, ad: sc.ad, N: sc.N, bil: sc.bil, p, pImp, ev: evBot, ort: ortX, h: pHam, pid: gr.id, durum: '' };
         tum.push(satir);
-        golgeListe.push({ i: id, e: mac.id, p: gr.id, t: sc.tip, n: sc.N, o: sc.bil, q: p, h: pHam, g: '', z: mac.ts });
+        const tahmin = { dk: Math.round(ana.dk * 10) / 10, dh: Math.round((ana.dk - (ana.karneDuz || 0)) * 10) / 10, nd: Math.round(o.dk * 10) / 10, ort: Math.round(ortX * 10) / 10, il: ana.ilkBelli ? (ana.bugunIlk ? 1 : 0) : -1, et: dayanak };
+        golgeListe.push({ i: id, e: mac.id, p: gr.id, t: sc.tip, n: sc.N, o: sc.bil, q: p, h: pHam, g: '', z: mac.ts, d: tahmin.dk, dh: tahmin.dh, m: tahmin.ort, il: tahmin.il, et: dayanak, a: soyad(o.ad) });
         if (evBot >= ESIK.supheli) { satir.durum = 'supheli'; supheli.push({ secim: satir.secim, bil: sc.bil, p, macAd }); return; }
         const kanitlar = ana.kanit.filter(k => Math.abs((k.a - k.f) * k.dDk) >= 1.5 || Math.abs((k.a - k.f) * Math.log(k.rho[b[0]] || 1)) >= 0.06);
         const zayifKanit = kanitlar.some(k => k.guc === 'zayıf') || (ana.adjDk === 0 && T0.yedekDagit.length > 0);
@@ -1815,7 +1871,8 @@
         }
         gerekce.push(pz);
         const dkYazi = Math.abs(ana.dk - o.dk) >= 1.5 ? 'normalde ' + v0(o.dk) + ' → bugün ' + v0(ana.dk) : v0(ana.dk) + ' civarı';
-        gerekce.push('Dakika: ' + dkYazi + ' · istikrar ' + ana.istikrar + (ana.bugunIlk ? ' · bugün ilk 5' + (ana.durumDegisti ? ' (normalde yedek)' : '') : (ana.durumDegisti ? ' · bugün yedek (normalde ilk 5)' : '')));
+        gerekce.push('Dakika: ' + dkYazi + ' · istikrar ' + ana.istikrar + (ana.bugunIlk ? ' · bugün ilk 5' + (ana.durumDegisti ? ' (normalde yedek)' : '') : (ana.durumDegisti ? ' · bugün yedek (normalde ilk 5)' : '')) +
+          (ana.karneDuz ? ' · karne düzeltmesi ' + isaretliSayi(ana.karneDuz) + ' dk (geçmiş dakika tahminlerime göre)' : ''));
         if (ana.donus) gerekce.push('Dönüş: son ' + ana.donus + ' maçı kaçırdı; dönüş maçında dakika sınırı olabilir diye dakikası %20 kısıldı.');
         kanitlar.forEach(k => {
           const ne = k.a === 1 ? k.ad + ' bugün yok' : k.ad + ' dönüyor (son ' + (k.n0 + k.n1) + ' maçın ' + k.n0 + ' tanesinde yoktu, o maçlardaki şişkinlik düzeltildi)';
@@ -1850,7 +1907,7 @@
         const bagli = kanitlar.filter(k => k.a === 1 && !(D0[k.X] && D0[k.X].kesin)).map(k => k.ad).concat(simler.length > 1 ? belirsizAd : []).concat(varsayim ? ['tahmini ilk 5'] : []);
         const s = {
           tip: sc.tip, k: sc.tip + '|' + gr.id + '|' + sc.N, secim: satir.secim, pazarAd: TIP[sc.tip].ad,
-          bil: sc.bil, p, pHam, evBot, ic, guven, gerekce, N: sc.N, oyuncu: o.ad, oyuncuId: gr.id, takimAd, ad: sc.ad, bagli
+          bil: sc.bil, p, pHam, evBot, ic, guven, gerekce, N: sc.N, oyuncu: o.ad, oyuncuId: gr.id, takimAd, ad: sc.ad, bagli, tahmin
         };
         if (!enIyi[sc.tip] || s.p > enIyi[sc.tip].p) enIyi[sc.tip] = s;
       });
@@ -1879,7 +1936,8 @@
     secilen.forEach(s => { secIds[s.id] = s.guven; });
     tum.forEach(r => { if (secIds[r.id]) r.durum = 'sinyal'; });
     golgeListe.forEach(g => { if (secIds[g.i]) g.g = secIds[g.i]; });
-    if (kesinMi) golgeEkle(golgeListe);
+    // Maç başladıktan sonra yapılan analiz gölge kayda girmez (kadroyu görerek "tahmin" etmiş olur)
+    if (kesinMi && (!mac.durum || mac.durum === 'notstarted')) golgeEkle(golgeListe);
     const rot = {
       ev: rotasyonOzet(ev, MA, OA, DA, proj[0].A, pzA, savA, etkiEv, ipA),
       dep: rotasyonOzet(dep, MB, OB, DB, proj[0].B, pzB, savB, etkiDep, ipB)
@@ -1951,7 +2009,8 @@
 
   // ---------- Tarama ----------
   let taraniyor = false, durdur = false, takipCalisiyor = false;
-  const sonAl = () => { const s = GM_getValue('bo_son', null); return s && s.surum === SURUM ? s : null; };
+  const UYUMLU = ['1.1', SURUM];   // biçimi aynı olan sürümlerin taraması geçerli sayılır
+  const sonAl = () => { const s = GM_getValue('bo_son', null); return s && UYUMLU.indexOf(s.surum) >= 0 ? s : null; };
   const sonYaz = x => GM_setValue('bo_son', Object.assign({ surum: SURUM }, x));
   const tumSinyaller = son => [].concat(...((son && son.maclar) || []).map(m => m.sinyaller || []));
   const basketSayfaId = () => (location.pathname.match(/mac-karti\/basketbol\/(\d+)/) || [])[1] || null;
@@ -1997,7 +2056,7 @@
       }
       const onceki = GM_getValue('bo_son', null);
       let tum = maclar;
-      if (tekBid && onceki && onceki.surum === SURUM) tum = (onceki.maclar || []).filter(x => !maclar.some(y => y.key === x.key) && x.ts > simdiSn() - 3 * 3600).concat(maclar).sort((a, c) => a.ts - c.ts);
+      if (tekBid && onceki && UYUMLU.indexOf(onceki.surum) >= 0) tum = (onceki.maclar || []).filter(x => !maclar.some(y => y.key === x.key) && x.ts > simdiSn() - 3 * 3600).concat(maclar).sort((a, c) => a.ts - c.ts);
       oranlariGuncelleKayit(tumSinyaller({ maclar }));
       sonYaz({ zaman: Date.now(), ozet, maclar: tum, durduruldu: durdur, tek: !!tekBid, kisit: ssKisit, pencere: ayar.pencere, pozHata: pozHatalar.slice(0, 4) });
       sinyalSekmesi();
@@ -2294,7 +2353,7 @@
           const st = p ? istatOku(p.statistics) : null;
           if (!st || !(st.sec > 0)) { sonucYaz(x.id, { durum: 'iade', neden: 'oynamadi', zaman: Date.now() }); yeni++; return; }
           const deger = TIP[x.tip].b.reduce((a, s) => a + (st[s] || 0), 0);
-          sonucYaz(x.id, { durum: deger >= x.N ? 'tuttu' : 'tutmadi', deger, dk: Math.round(st.sec / 60), zaman: Date.now() });
+          sonucYaz(x.id, { durum: deger >= x.N ? 'tuttu' : 'tutmadi', deger, dk: Math.round(st.sec / 60), ilk: p.substitute === false ? 1 : p.substitute === true ? 0 : -1, zaman: Date.now() });
           yeni++;
         });
       } catch (e) {}
@@ -2340,7 +2399,10 @@
     }
     const s = r.sonuc;
     const renk = !s ? '#fde047' : s.durum === 'tuttu' ? '#4ade80' : s.durum === 'tutmadi' ? '#f87171' : '#cbd5e1';
-    html += '<div style="margin-top:3px;font-weight:bold;color:' + renk + '">Sonuç: ' + sonucYazisi(r) + '</div><div style="margin-top:5px">';
+    html += '<div style="margin-top:3px;font-weight:bold;color:' + renk + '">Sonuç: ' + sonucYazisi(r) + '</div>';
+    const kk = kayitKarne(r);
+    if (kk) html += '<div class="bo-k">🔍 ' + h(karneSatir(kk)) + '</div>';
+    html += '<div style="margin-top:5px">';
     const b = (d, y) => '<button class="bo-kbtn" data-elle="' + d + '" data-id="' + h(r.id) + '">' + y + '</button> ';
     if (!s) html += b('tuttu', '✅ Tuttu') + b('tutmadi', '❌ Tutmadı') + b('iade', '↩️ İade');
     return html + '<button class="bo-kbtn" data-sil="' + h(r.id) + '">🗑️ Sil</button></div>';
@@ -2394,6 +2456,54 @@
     html += '<div class="bo-k">Bilyoner oranlarının ima ettiği ortalama ihtimal ' + yuzde(mean(g.map(x => 1 / x.o))) + ', gerçekleşen ' + yuzde(mean(g.map(x => x.r))) + (g.length >= 30 ? '' : ' (en az 30 sonuçta anlamlı olur)') + '</div>';
     const og = ogrenme();
     if (Object.keys(og).length) html += '<div class="bo-grup2">Öğrenme düzeltmeleri</div>' + Object.keys(og).map(t => '<div>' + TIP[t].ad + ': ' + (og[t].duz >= 0 ? '+' : '−') + Math.abs(Math.round(og[t].duz * 100)) + ' puan <span class="bo-k">(' + og[t].n + ' sonuç)</span></div>').join('');
+    return html;
+  }
+  // Tek tahminin karnesi: "dakika 31 → 26 (−5) · ilk 5: dedik ✓ başladı · beklenti 17,3 → 19 · sebep: …"
+  function karneSatir(x) {
+    const p = [];
+    if (x.d != null && x.gd != null) p.push('dakika ' + v0(x.d) + ' → ' + v0(x.gd) + ' (' + (Math.round(x.gd - x.d) === 0 ? '±0' : isaretliSayi(x.gd - x.d, v0)) + ')');
+    if ((x.il === 0 || x.il === 1) && (x.gi === 0 || x.gi === 1)) p.push('ilk 5: ' + (x.il ? 'dedik' : 'yedek dedik') + (x.il === x.gi ? ' ✓' : ' ✗ (' + (x.gi ? 'ilk 5\'te başladı' : 'yedekten başladı') + ')'));
+    if (x.m != null && x.v != null) p.push('beklenti ' + v1(x.m) + ' → gerçek ' + x.v);
+    const s = karneSebep(x);
+    if (s) p.push('sebep: ' + SEBEP_AD[s]);
+    return p.join(' · ');
+  }
+  function karneHtml() {
+    const veri = karneVerisi();
+    let html = '<div class="bo-grup">🔍 Maç sonu karnesi (nerede yanıldık?)</div>';
+    if (!veri.length) return html + '<div class="bo-k">Kadrosu kesin maçlar bitip sonuçlandıkça dolar. Her tahminde botun dediği dakika, ilk 5 ve beklenti ile gerçekte olan yan yana konur; tutmayanların sebebi ayrılır.</div>';
+    // Dakika
+    const tek = {};
+    veri.forEach(x => { if (x.d != null && x.gd > 0) tek[x.e + '|' + x.p] = x; });
+    const dl = Object.values(tek);
+    if (dl.length) {
+      const hata = dl.map(x => x.gd - x.d);
+      html += '<div class="bo-grup2">Dakika tahmini (' + dl.length + ' oyuncu-maç)</div>' +
+        '<div>Ortalama fark (gerçek − tahmin): <b>' + isaretliSayi(mean(hata)) + ' dk</b> · ±5 dk içinde: <b>' + yuzde(hata.filter(x => Math.abs(x) <= 5).length / hata.length) + '</b></div>';
+      const dz = dakikaDuzeltme();
+      html += '<div class="bo-k">İlk 5 dediklerimde ' + (dz.nilk ? isaretliSayi(dz.hilk) + ' dk (' + dz.nilk + ')' : '-') + ' · yedek dediklerimde ' + (dz.nyedek ? isaretliSayi(dz.hyedek) + ' dk (' + dz.nyedek + ')' : '-') + '</div>';
+      html += '<div class="bo-k">' + (dz.ilk || dz.yedek ? 'Bot bundan sonra dakikaları ilk 5\'te ' + isaretliSayi(dz.ilk) + ', yedekte ' + isaretliSayi(dz.yedek) + ' dk düzeltiyor.' : 'Dakika düzeltmesi her grupta en az 20 örnek birikince başlar.') + '</div>';
+      const il = dl.filter(x => (x.il === 0 || x.il === 1) && (x.gi === 0 || x.gi === 1));
+      if (il.length) html += '<div>İlk 5 tahmini doğru: <b>' + yuzde(il.filter(x => x.il === x.gi).length / il.length) + '</b> (' + il.length + ')</div>';
+    }
+    // Kayıp sebepleri
+    const kayip = veri.filter(x => x.r === 0);
+    if (kayip.length) {
+      const say = {};
+      kayip.forEach(x => { const s = karneSebep(x); say[s] = (say[s] || 0) + 1; });
+      html += '<div class="bo-grup2">Tutmayanların sebebi (' + kayip.length + ')</div>' + Object.keys(SEBEP_AD).filter(s => say[s]).sort((a, b) => say[b] - say[a])
+        .map(s => '<div>' + h(SEBEP_AD[s]) + ': <b>' + say[s] + '</b> (' + yuzde(say[s] / kayip.length) + ')</div>').join('');
+    }
+    // Dayanağa göre isabet
+    const et = Object.keys(ETIKET_AD).map(k => { const l = veri.filter(x => (x.et || '').indexOf(k) >= 0); return l.length ? '<div>' + ETIKET_AD[k] + ': <b>' + l.filter(x => x.r === 1).length + '/' + l.length + '</b> tuttu</div>' : ''; }).join('');
+    const duz = veri.filter(x => !x.et);
+    if (et) html += '<div class="bo-grup2">Neye dayandıysa ne kadar tuttu</div>' + et + (duz.length ? '<div class="bo-k">özel durumu olmayanlar: ' + duz.filter(x => x.r === 1).length + '/' + duz.length + '</div>' : '');
+    // Beklenti sapması pazar bazında
+    const pz = Object.keys(TIP).map(t => { const l = veri.filter(x => x.t === t && x.m != null && x.v != null); return l.length >= 5 ? '<div>' + TIP[t].ad + ': beklenti ' + v1(mean(l.map(x => x.m))) + ' → gerçek ' + v1(mean(l.map(x => x.v))) + ' (' + l.length + ')</div>' : ''; }).join('');
+    if (pz) html += '<div class="bo-grup2">Beklenti mi fazla, gerçek mi?</div>' + pz;
+    // Son sinyallerin karnesi
+    const son = golgeAl().filter(x => x.g && (x.r === 0 || x.r === 1) && x.d != null).slice(-6).reverse();
+    if (son.length) html += '<div class="bo-grup2">Son sinyallerin karnesi</div>' + son.map(x => '<div class="bo-sat">' + (x.r ? '✅ ' : '❌ ') + h((x.a ? x.a + ' ' : '') + x.n + '+ ' + TIP[x.t].birim) + ' · gerçek ' + x.v + '<br><span class="bo-k">' + h(karneSatir(x)) + '</span></div>').join('');
     return html;
   }
   function sinamaHtml() {
@@ -2611,7 +2721,7 @@
     if (not) html += '<div class="bo-durum">' + h(not) + '</div>';
     if (!k.length) html += '<div class="bo-k" style="padding:8px 0">Henüz kayıt yok. Bir sinyaldeki 💾 Kaydet\'e basınca burada görünür.</div>';
     else html += raporHtml(k);
-    html += golgeRapor() + sinamaHtml();
+    html += karneHtml() + golgeRapor() + sinamaHtml();
     if (k.length) {
       const bek = k.filter(r => !r.sonuc), bit = k.filter(r => r.sonuc);
       if (bek.length) html += '<div class="bo-grup">⏳ Bekleyenler (' + bek.length + ')</div>' + bek.map(r => kartHtml(r, 'kayit')).join('');
