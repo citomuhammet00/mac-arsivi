@@ -1,0 +1,105 @@
+name: Basket verisi topla
+
+on:
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  topla:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Biten basket maclarini topla
+        run: |
+          python3 - <<'PY'
+          import json, os, time, datetime, urllib.request, urllib.error
+
+          SS = "https://www.sofascore.com/api/v1"
+          KLASOR = "basket/gunler"
+          ISTAT_MAX = 400          # bir gecede istatistigi cekilecek en fazla mac
+          os.makedirs(KLASOR, exist_ok=True)
+          durum = {"zaman": datetime.datetime.utcnow().isoformat() + "Z", "istek": {}, "gunler": {}}
+
+          def al(yol):
+              req = urllib.request.Request(SS + yol, headers={
+                  "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36",
+                  "Accept": "application/json", "Referer": "https://www.sofascore.com/", "Origin": "https://www.sofascore.com"})
+              try:
+                  with urllib.request.urlopen(req, timeout=40) as r:
+                      kod = r.status
+                      veri = json.loads(r.read().decode("utf-8"))
+              except urllib.error.HTTPError as e:
+                  kod, veri = e.code, None
+              except Exception as e:
+                  kod, veri = "hata:" + type(e).__name__, None
+              durum["istek"][str(kod)] = durum["istek"].get(str(kod), 0) + 1
+              return veri
+
+          def periyotlar(sk):
+              p = [sk.get("period%d" % i) for i in range(1, 5)]
+              return p if all(isinstance(x, int) for x in p) else None
+
+          def istat(eid):
+              v = al("/event/%d/statistics" % eid)
+              if not v:
+                  return None
+              out = {}
+              for P in v.get("statistics", []):
+                  per, d = P.get("period"), {}
+                  for g in P.get("groups", []):
+                      for it in g.get("statisticsItems", []):
+                          k = it.get("key")
+                          if k in ("freeThrowsScored", "twoPointersScored", "threePointersScored"):
+                              d[k] = [it.get("homeValue"), it.get("homeTotal"), it.get("awayValue"), it.get("awayTotal")]
+                          elif k in ("offensiveRebounds", "defensiveRebounds", "turnovers", "totalFouls", "assists"):
+                              d[k] = [it.get("homeValue"), it.get("awayValue")]
+                  if d:
+                      out[per] = d
+              return out or None
+
+          istat_say = 0
+          bugun = datetime.datetime.utcnow().date()
+          for geri in (1, 2):
+              gun = (bugun - datetime.timedelta(days=geri)).isoformat()
+              yol = os.path.join(KLASOR, gun + ".json")
+              eski = json.load(open(yol)) if os.path.exists(yol) else {}
+              v = al("/sport/basketball/scheduled-events/" + gun)
+              if not v:
+                  durum["gunler"][gun] = "liste alinamadi"
+                  continue
+              maclar = dict(eski)
+              for e in v.get("events", []):
+                  if (e.get("status") or {}).get("type") != "finished":
+                      continue
+                  hs, aS = e.get("homeScore") or {}, e.get("awayScore") or {}
+                  ph, pa = periyotlar(hs), periyotlar(aS)
+                  if not ph or not pa:
+                      continue
+                  t, ut = e.get("tournament") or {}, (e.get("tournament") or {}).get("uniqueTournament") or {}
+                  eid = e["id"]
+                  kayit = maclar.get(str(eid)) or {
+                      "t": e.get("startTimestamp"), "lig": ut.get("name") or t.get("name"), "ut": ut.get("id"),
+                      "kat": ((t.get("category") or {}).get("name")), "ev": (e.get("homeTeam") or {}).get("name"), "evid": (e.get("homeTeam") or {}).get("id"),
+                      "dep": (e.get("awayTeam") or {}).get("name"), "depid": (e.get("awayTeam") or {}).get("id"),
+                      "s": [hs.get("current"), aS.get("current")], "q": [ph, pa], "ot": [hs.get("overtime"), aS.get("overtime")]}
+                  if "ist" not in kayit and istat_say < ISTAT_MAX:
+                      kayit["ist"] = istat(eid)
+                      istat_say += 1
+                      time.sleep(0.4)
+                  maclar[str(eid)] = kayit
+              json.dump(maclar, open(yol, "w"), ensure_ascii=False, separators=(",", ":"))
+              durum["gunler"][gun] = {"mac": len(maclar), "istatistikli": sum(1 for m in maclar.values() if m.get("ist"))}
+          json.dump(durum, open("basket/durum.json", "w"), ensure_ascii=False, indent=1)
+          print(json.dumps(durum, ensure_ascii=False))
+          PY
+      - name: Kaydet
+        run: |
+          git config user.name "basket-toplayici"
+          git config user.email "actions@users.noreply.github.com"
+          git add basket
+          git commit -m "Basket verisi $(date -u +%F)" || echo "degisiklik yok"
+          git push
