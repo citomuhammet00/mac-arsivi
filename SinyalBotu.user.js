@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sinyal Botu
 // @namespace    sinyalbotu
-// @version      2.0
+// @version      2.1
 // @description  Bilyoner futbol maçlarını tarar; her maç için 10 üzerinden puanlı bir ana sinyal ve barajı geçen diğer sinyalleri gerekçesiyle verir
 // @match        https://www.bilyoner.com/*
 // @grant        GM_xmlhttpRequest
@@ -11,6 +11,9 @@
 // @connect      statshub.com
 // @connect      www.statshub.com
 // @connect      www.bilyoner.com
+// @connect      sofascore.com
+// @connect      www.sofascore.com
+// @connect      api.sofascore.com
 // @run-at       document-end
 // @downloadURL  https://raw.githubusercontent.com/citomuhammet00/mac-arsivi/main/SinyalBotu.user.js
 // @updateURL    https://raw.githubusercontent.com/citomuhammet00/mac-arsivi/main/SinyalBotu.user.js
@@ -18,7 +21,7 @@
 (function () {
   'use strict';
 
-  const SURUM = '2.0';
+  const SURUM = '2.1';
   const ayar = Object.assign({ pencere: 3, macSayisi: 10 }, GM_getValue('sb_ayar', {}));
   const ayarKaydet = () => GM_setValue('sb_ayar', Object.assign({}, ayar));
   const lim0 = () => Number(ayar.macSayisi) || 10;
@@ -27,7 +30,7 @@
   const ESIK = {
     puan: 6,             // 10 üzerinden en az bu puan → sinyal
     minGetiri: 0.05,     // bot hesabına göre en az %5 beklenen getiri
-    minIhtimal: 0.30,    // çok düşük ihtimalli seçime sinyal yok
+    minIhtimal: 0.55,    // tutma ihtimali en az %55 olmayan seçime sinyal yok
     minMac: 5,           // oyuncu en az 5 maçta süre almış olmalı
     farkSuphe: 0.40,     // Bilyoner diğer siteden %40+ yüksekse → eşleşme şüpheli, sinyal yok
     modelPiyasa: 0.22,   // hesabım piyasanın ihtimalinden 22 puandan fazla yüksekse → hesap şüpheli
@@ -400,9 +403,23 @@
     };
     gez(v, []);
   }
-  async function kadroBilgisi(mac) {
+  async function kadroBilgisi(mac, adEv, adDep, evK, depK) {
     return onbellekli('ku|' + mac.id, async () => {
-      const sonuc = { durum: 'yok', o: {} };
+      // Önce Sofascore: kadro orada kesinse onu kullan. Mevki için Statshub'ın ayrıntılı mevkisi varsa o tercih edilir.
+      let sofa = null;
+      try { sofa = await sofaKadro(mac, adEv, adDep, evK, depK); } catch (e) {}
+      const sh = await statshubKadro(mac);
+      if (sofa && sofa.durum === 'resmi') {
+        Object.keys(sofa.o).forEach(id => { const d = sh.o[id]; if (d && d.poz && !GENEL_POZ.includes(pozKod(d.poz))) sofa.o[id].poz = d.poz; });
+        return { durum: 'resmi', o: sofa.o, kaynak: 'Sofascore' };
+      }
+      sh.sofa = sofa ? sofa.durum : 'hata';
+      return sh;
+    });
+  }
+  async function statshubKadro(mac) {
+    {
+      const sonuc = { durum: 'yok', o: {}, kaynak: 'Statshub' };
       let st = 'none';
       try { const v = await al(SH + '/event/lineup-status?ids=' + mac.id); st = String(((v && v.data) || {})[mac.id] || 'none'); } catch (e) {}
       if (st !== 'none' || mac.kadroResmi) {
@@ -420,7 +437,86 @@
         } catch (e) {}
       }
       return sonuc;
+    }
+  }
+
+  // ---------- Sofascore: resmi kadro ----------
+  const SS = 'https://www.sofascore.com/api/v1';
+  let ssKisit = false, ssSon = 0;
+  async function ssAl(yol) {
+    if (ssKisit) throw new Error('Sofascore şu an istek kabul etmiyor');
+    const bekle = Math.max(0, ssSon + 150 - Date.now());   // istekler arasında kısa ara
+    if (bekle) await new Promise(r => setTimeout(r, bekle));
+    ssSon = Date.now();
+    return new Promise((coz, red) => {
+      GM_xmlhttpRequest({
+        method: 'GET', url: SS + yol, timeout: 20000, headers: { Accept: 'application/json' },
+        onload: r => {
+          if (r.status === 403 || r.status === 429) { ssKisit = true; return red(new Error('Sofascore geçici sınır koydu')); }
+          if (r.status !== 200) return red(new Error('Sofascore cevabı ' + r.status));
+          try { coz(JSON.parse(r.responseText)); } catch (e) { red(new Error('Sofascore verisi okunamadı')); }
+        },
+        onerror: () => red(new Error('Sofascore bağlantı hatası')),
+        ontimeout: () => red(new Error('Sofascore zaman aşımı'))
+      });
     });
+  }
+  // Sofascore etkinliği bizim maçımız mı? İki takım adı + başlama saati
+  function ssMacUyar(e, mac, adEv, adDep) {
+    if (!e || !e.homeTeam || !e.awayTeam) return false;
+    if (mac.ts && e.startTimestamp && Math.abs(e.startTimestamp - mac.ts) > 3 * 3600) return false;
+    const ad = t => tokenlar(cevir((t.name || '') + ' ' + (t.shortName || '') + ' ' + String(t.slug || '').replace(/-/g, ' ')));
+    const oran = (adlar, T) => Math.max(0, ...adlar.filter(Boolean).map(a => { const x = tokenlar(cevir(a)); return x.length ? benzerlik(x, T, true) / x.length : 0; }));
+    return oran([adEv, mac.evAd], ad(e.homeTeam)) >= 0.5 && oran([adDep, mac.depAd], ad(e.awayTeam)) >= 0.5;
+  }
+  async function ssMacBul(mac, adEv, adDep) {
+    return onbellekli('ssm|' + mac.id, async () => {
+      // 1) Statshub ile aynı numara olabilir
+      try { const v = await ssAl('/event/' + mac.id); if (ssMacUyar(v && v.event, mac, adEv, adDep)) return v.event.id; } catch (e) { if (ssKisit) return null; }
+      // 2) Ev sahibi takımın sıradaki maçları
+      try {
+        const v = await ssAl('/team/' + mac.homeTeamId + '/events/next/0');
+        const e = (v.events || []).find(x => ssMacUyar(x, mac, adEv, adDep));
+        if (e) return e.id;
+      } catch (e) { if (ssKisit) return null; }
+      // 3) Takım adıyla arama
+      try {
+        const v = await ssAl('/search/all?q=' + encodeURIComponent(adEv));
+        const takimlar = (v.results || []).filter(r => r.type === 'team' && r.entity && r.entity.sport && r.entity.sport.slug === 'football').slice(0, 3);
+        for (const t of takimlar) {
+          const w = await ssAl('/team/' + t.entity.id + '/events/next/0');
+          const e = (w.events || []).find(x => ssMacUyar(x, mac, adEv, adDep));
+          if (e) return e.id;
+        }
+      } catch (e) {}
+      return null;
+    });
+  }
+  // Sofascore kadrosunu Statshub oyuncularına çevirir. Kesin değilse ya da eşleşme zayıfsa null.
+  async function sofaKadro(mac, adEv, adDep, evK, depK) {
+    const eid = await ssMacBul(mac, adEv, adDep);
+    if (!eid) return { durum: 'bulunamadi' };
+    let lu;
+    try { lu = await ssAl('/event/' + eid + '/lineups'); } catch (e) { return { durum: 'hata' }; }
+    if (!lu || lu.confirmed !== true) return { durum: 'kesin-degil' };
+    const o = {};
+    let zayif = false;
+    [[lu.home, evK], [lu.away, depK]].forEach(([t, liste]) => {
+      const pl = ((t && t.players) || []).filter(x => x && x.player);
+      const ilk = pl.filter(x => x.substitute === false);
+      let tutan = 0;
+      pl.forEach(x => {
+        const sid = String(x.player.id);
+        let bul = liste.find(y => String(y.id) === sid);
+        if (!bul) bul = enIyiAday(x.player.name || x.player.shortName || '', liste, y => y.name || '', y => y.id);
+        if (!bul) return;
+        if (!x.substitute) tutan++;
+        o[String(bul.id)] = { poz: x.position || '', yedek: x.substitute !== false };
+      });
+      if (ilk.length < 11 || tutan < 9) zayif = true;   // ilk 11'in en az 9'u eşleşmeli
+    });
+    if (zayif) return { durum: 'eslesmedi' };
+    return { durum: 'resmi', o };
   }
 
   // ---------- Seçim çözme ----------
@@ -475,10 +571,10 @@
   }
 
   // ---------- Puan (10 üzerinden) ----------
-  // değer 3 · ihtimal 2 · piyasa 2 · kadro 1,5 · veri 1,5
+  // ihtimal 3 · değer 2 · piyasa 2 · kadro 1,5 · veri 1,5
   function puanHesapla(x) {
-    const deger = 3 * sinirla(x.getiri / 0.35, 0, 1);
-    const ihtimal = 2 * sinirla((x.p - 0.30) / 0.50, 0, 1);
+    const deger = 2 * sinirla(x.getiri / 0.30, 0, 1);
+    const ihtimal = 3 * sinirla((x.p - 0.55) / 0.30, 0, 1);
     let piyasaP;
     if (x.ref) {
       const fark = x.bil / x.ref.en - 1;
@@ -792,7 +888,7 @@
         else if (s.taraf === 'dep') { tA = A.filter(r => tutF(r.rakip)).length; tB = B.filter(r => tutF(r.kendi)).length; }
         else { tA = A.filter(r => tutF(r.kendi + r.rakip)).length; tB = B.filter(r => tutF(r.kendi + r.rakip)).length; }
         const rA = tA / A.length, rB = tB / B.length;
-        if (getiri < ESIK.minGetiri || p < 0.40 || rA < 0.5 || rB < 0.5) continue;
+        if (getiri < ESIK.minGetiri || p < ESIK.minIhtimal || rA < 0.5 || rB < 0.5) continue;
         if (supheliMi(p, getiri, null, s.bil)) continue;
         const puan = puanHesapla({ p, getiri, ref: null, bil: s.bil, kadro: 'takim', n: Mo.n, tutOran: (rA + rB) / 2 });
         if (puan.toplam < ESIK.puan) continue;
@@ -878,8 +974,8 @@
     if (oSecim.length) {
       const tipler = [...new Set(oSecim.map(s => s.tip))];
       const keyler = [...new Set(['totalShotsOnGoal'].concat(tipler.map(t => OTIP[t].takimKey).filter(Boolean)))];
-      const [evK, depK, kb0] = await Promise.all([oyuncuListesi(mac.homeTeamId), oyuncuListesi(mac.awayTeamId), kadroBilgisi(mac)]);
-      kb = kb0;
+      const [evK, depK] = await Promise.all([oyuncuListesi(mac.homeTeamId), oyuncuListesi(mac.awayTeamId)]);
+      kb = await kadroBilgisi(mac, adEv, adDep, evK, depK);
       const satir = {};
       for (const key of keyler) {
         const [A, B] = await Promise.all([
@@ -950,7 +1046,7 @@
     return {
       durum: 'tamam', bm: { bid: bm.bid, ev: bm.ev || ev, dep: bm.dep || dep, evU: bm.evU || '', depU: bm.depU || '', ts, lig: bm.lig || '' },
       macAd: adEv + ' - ' + adDep, shAd: mac.evAd && mac.depAd ? mac.evAd + ' - ' + mac.depAd : '', ts, lig: bm.lig || '',
-      kadro: kb.durum, sinyaller: secilen, fiyat, eslesmeyenOyuncu, oyuncuSecimSay: oSecim.length
+      kadro: kb.durum, kadroKaynak: kb.kaynak || '', sofaDurum: kb.sofa || '', sinyaller: secilen, fiyat, eslesmeyenOyuncu, oyuncuSecimSay: oSecim.length
     };
   }
 
@@ -961,13 +1057,13 @@
   const macSayfasiId = () => /\/mac-karti\/futbol\//.test(location.pathname) ? ((location.pathname.match(/mac-karti\/[^/]+\/(\d+)/) || [])[1] || null) : null;
   const pencereYazi = () => Number(ayar.pencere) >= 24 ? 'bütün gün' : ayar.pencere + ' saat';
 
-  async function maclariIsle(liste, onceki) {
+  async function maclariIsle(liste, sessiz) {
     const sonuclar = [], eslesmeyen = [];
     let hata = 0;
     for (let i = 0; i < liste.length; i++) {
       if (durdur) break;
       const m = liste[i];
-      ilerleme((i + 1) + '/' + liste.length + ' · ' + h(m.ev ? m.ev + ' - ' + m.dep : 'maç okunuyor') + '<br>Şimdiye kadar ' + sonuclar.filter(r => r.sinyaller.length).length + ' maçta sinyal');
+      if (!sessiz) ilerleme((i + 1) + '/' + liste.length + ' · ' + h(m.ev ? m.ev + ' - ' + m.dep : 'maç okunuyor') + '<br>Şimdiye kadar ' + sonuclar.filter(r => r.sinyaller.length).length + ' maçta sinyal');
       try {
         const r = await macAnaliz(m);
         if (r.durum === 'tamam') sonuclar.push(r);
@@ -979,7 +1075,7 @@
 
   async function tara(sadeceBu) {
     if (taraniyor) return;
-    taraniyor = true; durdur = false; C = {};
+    taraniyor = true; durdur = false; C = {}; ssKisit = false;
     try {
       let liste;
       if (sadeceBu) {
@@ -1008,7 +1104,7 @@
     if (taraniyor) return;
     const son = sonAl(), liste = yenilenecek(son);
     if (!liste.length) { sinyalSekmesi(); return; }
-    taraniyor = true; durdur = false; C = {};
+    taraniyor = true; durdur = false; C = {}; ssKisit = false;
     try {
       const r = await maclariIsle(liste.map(m => m.bm));
       const yeni = {};
@@ -1022,6 +1118,49 @@
     } finally {
       taraniyor = false;
     }
+  }
+
+  // Maça 45 dk kala, kadrosu kesin olmayan maçlara bir kez kendiliğinden bakar (Bilyoner açıkken)
+  async function otoKadro() {
+    if (taraniyor) return;
+    const son = sonAl();
+    if (!son || !son.maclar) return;
+    const simdi = Date.now() / 1000;
+    const aday = son.maclar.filter(m => !m.oto45 && m.kadro !== 'resmi' && (m.oyuncuSecimSay || 0) > 0 && m.ts - simdi <= 45 * 60 && m.ts - simdi > 60);
+    if (!aday.length) return;
+    taraniyor = true; durdur = false; C = {}; ssKisit = false;
+    try {
+      const r = await maclariIsle(aday.map(m => m.bm), true);
+      const yeni = {};
+      r.sonuclar.forEach(m => { m.oto45 = true; yeni[m.bm.bid] = m; });
+      const guncel = sonAl() || son;
+      let kesinlesen = 0;
+      guncel.maclar = guncel.maclar.map(m => {
+        if (aday.some(a => a.bm.bid === m.bm.bid)) {
+          const y = yeni[m.bm.bid] || Object.assign({}, m, { oto45: true });
+          if (y.kadro === 'resmi' && y.sinyaller.some(s => s.kesin)) kesinlesen++;
+          return y;
+        }
+        return m;
+      });
+      sonYaz(guncel);
+      const p = document.getElementById('sb-panel');
+      if (p && p.style.display === 'block' && !/Kayıtlar \(/.test((p.querySelector('.sb-sekme .sec') || {}).textContent || '')) sinyalSekmesi();
+      bildirim(kesinlesen ? '✅ Kadro kesinleşti: ' + kesinlesen + ' maçta kesin sinyal var' : '⏳ 45 dk kontrolü yapıldı (' + aday.length + ' maç)');
+    } catch (e) {} finally { taraniyor = false; }
+  }
+  function bildirim(yazi) {
+    let t = document.getElementById('sb-bildirim');
+    if (!t) {
+      t = document.createElement('div');
+      t.id = 'sb-bildirim';
+      t.style.cssText = 'position:fixed;right:12px;bottom:360px;z-index:2147483646;max-width:70%;background:#1e2238;color:#e8eaf6;border:1px solid #6366f1;border-radius:10px;padding:8px 10px;font:13px sans-serif;box-shadow:0 2px 10px #0009';
+      t.addEventListener('click', () => { t.style.display = 'none'; sinyalSekmesi(); });
+      document.body.appendChild(t);
+    }
+    t.textContent = yazi + ' · dokun';
+    t.style.display = 'block';
+    clearTimeout(t.__z); t.__z = setTimeout(() => { t.style.display = 'none'; }, 15000);
   }
 
   // ---------- Kayıtlar ----------
@@ -1115,7 +1254,7 @@
     return s.kesin ? '<span class="sb-rozet sb-r-kesin">Kesin</span>' : '<span class="sb-rozet sb-r-on">Ön sinyal · kadro bekleniyor</span>';
   }
   function dokum(pu) {
-    return 'Puan dökümü: değer ' + v1(pu.deger) + '/3 · ihtimal ' + v1(pu.ihtimal) + '/2 · piyasa ' + v1(pu.piyasa) + '/2 · kadro ' + v1(pu.kadro) + '/1,5 · veri ' + v1(pu.veri) + '/1,5';
+    return 'Puan dökümü: ihtimal ' + v1(pu.ihtimal) + '/3 · değer ' + v1(pu.deger) + '/2 · piyasa ' + v1(pu.piyasa) + '/2 · kadro ' + v1(pu.kadro) + '/1,5 · veri ' + v1(pu.veri) + '/1,5';
   }
   function kaydetBtn(s) {
     const var_ = kayitliMi(s.id);
@@ -1141,7 +1280,8 @@
   function macHtml(m) {
     let html = '<div class="sb-mackart">';
     html += '<div class="sb-mac">⚽ <b>' + h(m.macAd) + '</b> · ' + saatYaz(m.ts) + (m.lig ? ' · ' + h(m.lig) : '') + '</div>';
-    html += '<div class="sb-k">' + (KADRO_YAZI[m.kadro] || '') + (m.shAd ? ' · Statshub: ' + h(m.shAd) : '') + '</div>';
+    const kaynakYazi = m.kadro === 'resmi' && m.kadroKaynak ? ' (' + h(m.kadroKaynak) + ')' : m.kadro !== 'resmi' && m.sofaDurum === 'kesin-degil' ? ' · Sofascore\'da henüz kesin değil' : '';
+    html += '<div class="sb-k">' + (KADRO_YAZI[m.kadro] || '') + kaynakYazi + (m.shAd ? ' · Statshub: ' + h(m.shAd) : '') + (m.oto45 ? ' · 45 dk kala kontrol edildi' : '') + '</div>';
     const [ana, ...diger] = m.sinyaller;
     html += anaHtml(ana);
     if (diger.length) html += '<div class="sb-alt">Diğer sinyaller (' + diger.length + ')</div>' + diger.map(digerHtml).join('');
@@ -1309,7 +1449,7 @@
         ' · ' + son.mac + ' maç · Statshub\'da bulunan ' + son.maclar.length + ' · <b>' + sinyalli.length + ' maçta sinyal</b> (' + kesin + ' kesin, ' + (sinyalli.length - kesin) + ' kadro bekliyor)' +
         (son.durduruldu ? ' · yarıda durduruldu' : '') + '</div>';
       if (yen.length) html += '<button class="sb-ana" data-islem="kadroYenile" style="background:#fbbf24">🔄 Kadro bekleyen ' + yen.length + ' maçı yenile</button>';
-      if (!sinyalli.length) html += '<div class="sb-k" style="padding:8px 0">Bu taramada 6/10 barajını geçen seçim çıkmadı. Bu normal: bot ancak hesabı, piyasası ve verisi yeterince sağlam seçimlere sinyal veriyor.</div>';
+      if (!sinyalli.length) html += '<div class="sb-k" style="padding:8px 0">Bu taramada tutma ihtimali en az %55 olan ve 6/10 barajını geçen seçim çıkmadı. Bu normal: bot ancak hesabı, piyasası ve verisi yeterince sağlam seçimlere sinyal veriyor.</div>';
       sinyalli.sort((a, b) => (b.sinyaller[0].kesin - a.sinyaller[0].kesin) || (b.sinyaller[0].puan.toplam - a.sinyaller[0].puan.toplam));
       html += sinyalli.map(macHtml).join('');
       const sinyalsiz = son.maclar.filter(m => !(m.sinyaller && m.sinyaller.length));
@@ -1425,4 +1565,5 @@
   css();
   butonKoy();
   setInterval(butonKoy, 2000);
+  setInterval(otoKadro, 60000);
 })();
