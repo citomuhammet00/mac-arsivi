@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Basket Oyuncu Sinyal
 // @namespace    basketoyuncusinyal
-// @version      1.3
+// @version      1.4
 // @description  Bilyoner basketbol oyuncu bahisleri (NBA + EuroLeague): kesin kadro takibi, oyun içi pozisyon analizi, rotasyon/yokluk etkisi, maç senaryosu, simülasyon, gölge kayıt ve kendini sınama
 // @match        https://www.bilyoner.com/*
 // @grant        GM_xmlhttpRequest
@@ -22,11 +22,13 @@
 // @connect      flashscore.ninja
 // @connect      10.flashscore.ninja
 // @run-at       document-end
+// @downloadURL  https://raw.githubusercontent.com/citomuhammet00/mac-arsivi/main/BasketOyuncuSinyal.user.js
+// @updateURL    https://raw.githubusercontent.com/citomuhammet00/mac-arsivi/main/BasketOyuncuSinyal.user.js
 // ==/UserScript==
 (function () {
   'use strict';
 
-  const SURUM = '1.3';
+  const SURUM = '1.4';
   const SS = 'https://www.sofascore.com/api/v1';
   const ESPN = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba';
   const EL_LIVE = 'https://live.euroleague.net/api';
@@ -2041,7 +2043,7 @@
 
   // ---------- Tarama ----------
   let taraniyor = false, durdur = false, takipCalisiyor = false;
-  const UYUMLU = ['1.1', '1.2', SURUM];   // biçimi aynı olan sürümlerin taraması geçerli sayılır
+  const UYUMLU = ['1.1', '1.2', '1.3', SURUM];   // biçimi aynı olan sürümlerin taraması geçerli sayılır
   const sonAl = () => { const s = GM_getValue('bo_son', null); return s && UYUMLU.indexOf(s.surum) >= 0 ? s : null; };
   const sonYaz = x => GM_setValue('bo_son', Object.assign({ surum: SURUM }, x));
   const tumSinyaller = son => [].concat(...((son && son.maclar) || []).map(m => m.sinyaller || []));
@@ -2404,10 +2406,12 @@
   const zamanYaz = ms => new Date(ms).toLocaleDateString('tr-TR', { day: '2-digit', month: '2-digit' }) + ' ' + new Date(ms).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' });
   const saatSadece = ms => ms ? new Date(ms).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }) : '-';
   function kartHtml(s, mod) {
-    let html = '<div class="bo-kart bo-' + s.guven + '">';
+    const on = mod === 'on' || (mod === 'kayit' && s.kesin === false);
+    let html = '<div class="bo-kart bo-' + s.guven + (on ? ' bo-onkart' : '') + '">';
     html += '<div class="bo-mac">🏀 ' + h(s.macAd) + ' · ' + saatYaz(s.ts) + (s.lig ? ' · ' + h(s.lig) : '') + '</div>';
-    html += '<div><b>' + h(s.secim) + '</b> · Bilyoner <b>' + v2(s.bil) + '</b> <span class="bo-rozet bo-r-' + s.guven + '">' + (s.guven === 'yuksek' ? 'Güven: yüksek' : 'Güven: orta') + '</span>' + (s.elle ? ' <span class="bo-rozet bo-r-elle">✋ elle doğrulandı</span>' : '') + '</div>';
+    html += '<div><b>' + h(s.secim) + '</b> · Bilyoner <b>' + v2(s.bil) + '</b> <span class="bo-rozet bo-r-' + s.guven + '">' + (s.guven === 'yuksek' ? 'Güven: yüksek' : 'Güven: orta') + '</span>' + (s.elle ? ' <span class="bo-rozet bo-r-elle">✋ elle doğrulandı</span>' : '') + (on ? ' <span class="bo-rozet bo-r-on">⏳ Ön sinyal</span>' : '') + '</div>';
     html += '<div class="bo-k">' + h(s.oyuncu) + ' · ' + h(s.takimAd) + '</div>';
+    if (on && mod === 'on') html += '<div class="bo-k">⏳ Kadro henüz kesin değil' + (s.bagli && s.bagli.length ? ' · dayandığı varsayım: ' + h(s.bagli.join(', ')) : '') + '. Oyuncu hiç süre almazsa bahis iade olur.</div>';
     html += '<ul class="bo-gerekce">' + s.gerekce.map(g => '<li>' + h(g) + '</li>').join('') + '</ul>';
     if (mod === 'kayit') return html + kayitAltHtml(s) + '</div>';
     const var_ = kayitliMi(s.id);
@@ -2593,6 +2597,8 @@
       '#bo-panel table.bo-tab th{color:#fed7aa;font-weight:bold}' +
       '#bo-panel table.bo-tab tr.bo-tr-sinyal td{background:#3a2a12}' +
       '#bo-panel table.bo-tab tr.bo-tr-supheli td{color:#a8a29e}' +
+      '#bo-panel .bo-onkart{opacity:.8;border-left-style:dashed !important}' +
+      '#bo-panel .bo-r-on{background:#57534e;color:#f5f5f4}' +
       '#bo-panel .bo-rol{display:block;font-size:10.5px;color:#c9b6a5}' +
       '#bo-panel .bo-not{margin-top:6px;font-size:13px}' +
       '#bo-panel .bo-up{color:#4ade80}#bo-panel .bo-down{color:#f87171}';
@@ -2634,7 +2640,7 @@
     const n = (m.sinyaller || []).length;
     return '<div class="bo-kart bo-bek"><div class="bo-mac">🏀 ' + h(m.macAd) + ' · ' + saatYaz(m.ts) + (m.lig ? ' · ' + h(m.lig) : '') + '</div>' +
       '<div>' + (m.basladi ? '▶ Maç başladı' : h(m.kadroYazi)) + '</div>' + (m.uyari ? '<div class="bo-k">⚠️ ' + h(m.uyari) + '</div>' : '') +
-      '<div class="bo-k">Aday sinyal: <b>' + n + '</b> (kadro kesinleşince gösterilir) · son kontrol ' + saatSadece(m.sonKontrol) + (m.espnNot ? '<br>⚠️ ' + h(m.espnNot) : '') + '</div>' +
+      '<div class="bo-k">Aday sinyal: <b>' + n + '</b> (yukarıda ön sinyal olarak) · son kontrol ' + saatSadece(m.sonKontrol) + (m.espnNot ? '<br>⚠️ ' + h(m.espnNot) : '') + '</div>' +
       '<button class="bo-kbtn" data-rot="' + h(m.key) + '">📋 Rotasyon</button> <button class="bo-kbtn" data-tum="' + h(m.key) + '">📊 Tüm oranlar</button>' +
       (m.basladi ? '' : ' <button class="bo-kbtn" data-ellekesin="' + h(m.key) + '">✋ Kadroyu ben doğruladım</button>') + '</div>';
   }
@@ -2652,7 +2658,7 @@
       o.baglanacak.map(t => '<button data-bagla="' + h(t) + '">🔗 ' + h(t) + '</button>').join('') + '</div>';
     const kesinler = maclar.filter(m => m.kesin), bekleyen = maclar.filter(m => !m.kesin);
     html += '<div class="bo-grup">✅ Kadrosu kesin maçlar — sinyaller</div>';
-    if (!kesinler.length) html += '<div class="bo-k">Henüz kadrosu kesinleşen maç yok. Kadrolar genelde maçtan 30–90 dk önce netleşir.' + (ayar.takip ? ' Bilyoner açık kaldıkça bekleyen maçlara 10 dakikada bir bakarım, kadro kesinleşince haber veririm.' : ' (Kadro takibi kapalı.)') + '</div>';
+    if (!kesinler.length) html += '<div class="bo-k">Henüz kadrosu kesinleşen maç yok. Bazı liglerde kadro maç başlayana kadar kesinleşmez; o maçların sinyalleri aşağıda ön sinyal olarak duruyor.' + (ayar.takip ? ' Bilyoner açık kaldıkça bekleyen maçlara 10 dakikada bir bakarım, kadro kesinleşince haber veririm.' : ' (Kadro takibi kapalı.)') + '</div>';
     else {
       const tumS = tumSinyaller({ maclar: kesinler });
       if (!tumS.length) html += '<div class="bo-k" style="padding:6px 0">Kadrosu kesin maçlarda şartları sağlayan seçim çıkmadı. Bot sadece hesabı, dakika istikrarı ve Bilyoner\'in kendi oranları birlikte destekliyorsa sinyal veriyor.</div>';
@@ -2663,6 +2669,20 @@
       html += '<div class="bo-grup2">Maçlar</div>' + kesinler.map(m => '<div class="bo-sat">' + h(m.macAd) + ' · ' + saatYaz(m.ts) + '<br><span class="bo-k">' + h(m.kadroYazi) + (m.uyari ? '<br>⚠️ ' + h(m.uyari) : '') + '</span><br>' +
         '<button class="bo-kbtn" data-rot="' + h(m.key) + '">📋 Rotasyon</button> <button class="bo-kbtn" data-tum="' + h(m.key) + '">📊 Tüm oranlar</button></div>').join('');
       if (tumS.length) html += '<div class="bo-k" style="margin-top:8px">Sinyaller analiz anındaki oranlarla hesaplandı. Oynamadan önce Bilyoner\'deki güncel orana bak.</div>';
+    }
+    // Ön sinyaller: kadrosu kesinleşmemiş maçlar. Oyuncunun kendisi belirsiz (şüpheli) ise gösterilmez.
+    const acik = bekleyen.filter(m => !m.basladi);
+    const onS = tumSinyaller({ maclar: acik }).filter(s => !(s.bagli || []).includes(s.oyuncu));
+    const onElenen = tumSinyaller({ maclar: acik }).length - onS.length;
+    if (acik.length) {
+      html += '<div class="bo-grup">⏳ Ön sinyaller — kadro henüz kesin değil (' + onS.length + ')</div>';
+      html += '<div class="bo-k">Sakatlık raporu ve eksik listesine göre hesaplandı. Basketbolda oyuncunun ilk 5\'te başlaması gerekmez; 1 dakika bile oynarsa bahis geçerli, hiç oynamazsa iade. Risk, dakikasının beklenenden az olması.' +
+        (onElenen ? ' Kendisi şüpheli olan ' + onElenen + ' oyuncunun sinyali gösterilmedi.' : '') + '</div>';
+      ['yuksek', 'orta'].forEach(g => {
+        const gr = onS.filter(s => s.guven === g).sort((a, b) => b.p - a.p);
+        if (gr.length) html += '<div class="bo-grup2">' + GUVEN_YAZI[g] + ' (' + gr.length + ')</div>' + gr.map(s => kartHtml(s, 'on')).join('');
+      });
+      if (!onS.length) html += '<div class="bo-k" style="padding:6px 0">Bu maçlarda şu an şartları sağlayan seçim yok.</div>';
     }
     if (bekleyen.length) html += '<div class="bo-grup">⏳ Kadro bekleniyor (' + bekleyen.length + ')</div>' + bekleyen.slice().sort((a, b) => a.ts - b.ts).map(bekleyenKart).join('');
     const supheli = [].concat(...maclar.map(m => m.supheli || [])).slice(0, 8);
